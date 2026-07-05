@@ -1,0 +1,118 @@
+# ============================================
+#   DPI Engine - .gitignore
+#   C++ Network Packet Analyzer Project
+# ============================================
+
+# --------------------------
+# Compiled Binaries & Output
+# --------------------------
+*.exe
+*.out
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+dpi_engine
+fix
+
+# --------------------------
+# PCAP / Network Capture Files
+# (These can be huge - never push these!)
+# --------------------------
+*.pcap
+*.pcapng
+*.cap
+
+# --------------------------
+# Build Directories
+# --------------------------
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# --------------------------
+# Temporary / Test Files
+# --------------------------
+fix.cpp
+fix.exe
+fix.ps1
+fix_borders.py
+*.tmp
+*.log
+*.bak
+
+# --------------------------
+# IDE & Editor Files
+# --------------------------
+
+# Visual Studio Code
+.vscode/
+
+# Visual Studio
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.aps
+*.pch
+*.vspscc
+*.vssscc
+ipch/
+*.ipch
+
+# CLion / JetBrains
+.idea/
+*.iml
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+\#*\#
+.#*
+
+# --------------------------
+# Duplicate / Old Source Files
+# (Ye sab purane experiments the, actual engine dpi_mt.cpp + main_dpi.cpp hai)
+# --------------------------
+src/main.cpp
+src/main_simple.cpp
+src/main_working.cpp
+src/dpi_engine.cpp
+
+# --------------------------
+# Windows System Files
+# --------------------------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --------------------------
+# macOS (agar koi Mac pe clone kare)
+# --------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --------------------------
+# Crash & Debug Files
+# --------------------------
+*.pdb
+*.ilk
+*.exp
+*.map
+crash_dumps/
