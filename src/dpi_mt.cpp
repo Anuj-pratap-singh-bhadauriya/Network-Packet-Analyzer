@@ -164,6 +164,71 @@ private:
 };
 
 // =============================================================================
+// Firewall Logger (thread-safe) - Red alerts + log file
+// =============================================================================
+class FirewallLogger {
+public:
+    void open(const std::string& log_file) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        log_.open(log_file, std::ios::out | std::ios::trunc);
+        if (log_.is_open()) {
+            log_ << "\n=== Firewall Session Started ===\n";
+            log_.flush();
+        }
+    }
+
+    void alert(const std::string& reason, const std::string& detail,
+               const std::string& src_ip, const std::string& dst_ip) {
+        auto now = std::chrono::system_clock::now();
+        auto t   = std::chrono::system_clock::to_time_t(now);
+        char timebuf[32];
+        std::strftime(timebuf, sizeof(timebuf), "%H:%M:%S", std::localtime(&t));
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // Red color terminal alert
+#ifdef _WIN32
+        HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_INTENSITY);
+#else
+        std::cout << "\033[1;31m";
+#endif
+        std::cout << "[FIREWALL ALERT " << timebuf << "] "
+                  << "🛑 BLOCKED [" << reason << ": " << detail << "] "
+                  << src_ip << " -> " << dst_ip << "\n";
+#ifdef _WIN32
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+#else
+        std::cout << "\033[0m";
+#endif
+
+        // Write to log file
+        if (log_.is_open()) {
+            log_ << "[" << timebuf << "] BLOCKED " << reason << ": " << detail
+                 << " | " << src_ip << " -> " << dst_ip << "\n";
+            log_.flush();
+        }
+
+        total_alerts_++;
+    }
+
+    uint64_t totalAlerts() const { return total_alerts_.load(); }
+
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (log_.is_open()) {
+            log_ << "=== Session Ended. Total Blocked: " << total_alerts_.load() << " ===\n";
+            log_.close();
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::ofstream log_;
+    std::atomic<uint64_t> total_alerts_{0};
+};
+
+// =============================================================================
 // Statistics (thread-safe)
 // =============================================================================
 struct Stats {
@@ -173,12 +238,12 @@ struct Stats {
     std::atomic<uint64_t> dropped{0};
     std::atomic<uint64_t> tcp_packets{0};
     std::atomic<uint64_t> udp_packets{0};
-    
+
     // Per-app stats (protected by mutex)
     std::mutex app_mutex;
     std::unordered_map<AppType, uint64_t> app_counts;
     std::unordered_map<std::string, AppType> detected_snis;
-    
+
     void recordApp(AppType app, const std::string& sni) {
         std::lock_guard<std::mutex> lock(app_mutex);
         app_counts[app]++;
@@ -193,8 +258,10 @@ struct Stats {
 // =============================================================================
 class FastPath {
 public:
-    FastPath(int id, Rules* rules, Stats* stats, TSQueue<Packet>* output_queue)
-        : id_(id), rules_(rules), stats_(stats), output_queue_(output_queue) {}
+    FastPath(int id, Rules* rules, Stats* stats, TSQueue<Packet>* output_queue,
+             FirewallLogger* fw_logger)
+        : id_(id), rules_(rules), stats_(stats), output_queue_(output_queue),
+          fw_logger_(fw_logger) {}
     
     void start() {
         running_ = true;
@@ -216,6 +283,7 @@ private:
     Rules* rules_;
     Stats* stats_;
     TSQueue<Packet>* output_queue_;
+    FirewallLogger* fw_logger_;
     TSQueue<Packet> input_queue_;
     std::unordered_map<FiveTuple, FlowEntry, FiveTupleHash> flows_;
     
@@ -246,12 +314,33 @@ private:
             
             // Check blocking
             if (!flow.blocked) {
-                flow.blocked = rules_->isBlocked(pkt.tuple.src_ip, flow.app_type, flow.sni);
+                bool newly_blocked = rules_->isBlocked(pkt.tuple.src_ip, flow.app_type, flow.sni);
+                if (newly_blocked && !flow.blocked) {
+                    // First time this flow is being blocked - fire an alert
+                    auto ipToStr = [](uint32_t ip) {
+                        return std::to_string(ip & 0xFF) + "." +
+                               std::to_string((ip >> 8) & 0xFF) + "." +
+                               std::to_string((ip >> 16) & 0xFF) + "." +
+                               std::to_string((ip >> 24) & 0xFF);
+                    };
+                    std::string block_reason = flow.sni.empty()
+                        ? appTypeToString(flow.app_type)
+                        : flow.sni;
+                    if (fw_logger_) {
+                        fw_logger_->alert(
+                            appTypeToString(flow.app_type),
+                            block_reason,
+                            ipToStr(pkt.tuple.src_ip),
+                            ipToStr(pkt.tuple.dst_ip)
+                        );
+                    }
+                }
+                flow.blocked = newly_blocked;
             }
-            
+
             // Record stats
             stats_->recordApp(flow.app_type, flow.sni);
-            
+
             // Forward or drop
             if (flow.blocked) {
                 stats_->dropped++;
@@ -393,19 +482,19 @@ public:
     
     DPIEngine(const Config& cfg) : config_(cfg) {
         int total_fps = cfg.num_lbs * cfg.fps_per_lb;
-        
+
         std::cout << "\n";
         std::cout << "+--------------------------------------------------------------+\n";
         std::cout << "|              DPI ENGINE v2.0 (Multi-threaded)                 |\n";
         std::cout << "+--------------------------------------------------------------+\n";
-        std::cout << "| Load Balancers: " << std::setw(2) << cfg.num_lbs 
+        std::cout << "| Load Balancers: " << std::setw(2) << cfg.num_lbs
                   << "    FPs per LB: " << std::setw(2) << cfg.fps_per_lb
                   << "    Total FPs: " << std::setw(2) << total_fps << "     |\n";
         std::cout << "+--------------------------------------------------------------+\n\n";
-        
+
         // Create FP threads
         for (int i = 0; i < total_fps; i++) {
-            fps_.push_back(std::make_unique<FastPath>(i, &rules_, &stats_, &output_queue_));
+            fps_.push_back(std::make_unique<FastPath>(i, &rules_, &stats_, &output_queue_, &fw_logger_));
         }
         
         // Create LB threads, each managing a subset of FPs
@@ -423,7 +512,10 @@ public:
     void blockApp(const std::string& app) { rules_.blockApp(app); }
     void blockDomain(const std::string& dom) { rules_.blockDomain(dom); }
     
-    bool process(const std::string& input_file, const std::string& output_file) {
+    bool process(const std::string& input_file, const std::string& output_file,
+                 const std::string& log_file = "firewall_alerts.log") {
+        // Open firewall log
+        fw_logger_.open(log_file);
         // Open input
         PcapReader reader;
         if (!reader.open(input_file)) return false;
@@ -532,10 +624,11 @@ public:
         output_thread.join();
         
         output.close();
-        
+        fw_logger_.close();
+
         // Print report
         printReport();
-        
+
         return true;
     }
 
@@ -543,6 +636,7 @@ private:
     Config config_;
     Rules rules_;
     Stats stats_;
+    FirewallLogger fw_logger_;
     TSQueue<Packet> output_queue_;
     std::vector<std::unique_ptr<FastPath>> fps_;
     std::vector<std::unique_ptr<LoadBalancer>> lbs_;
@@ -595,7 +689,31 @@ private:
         }
         
         std::cout << "+--------------------------------------------------------------+\n";
-        
+
+        // Firewall summary
+        uint64_t alerts = fw_logger_.totalAlerts();
+        if (alerts > 0) {
+            std::cout << "\n";
+#ifdef _WIN32
+            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_INTENSITY);
+#else
+            std::cout << "\033[1;31m";
+#endif
+            std::cout << "+--------------------------------------------------------------+\n";
+            std::cout << "|                   FIREWALL SUMMARY                            |\n";
+            std::cout << "+--------------------------------------------------------------+\n";
+            std::cout << "| Total Flows Blocked: " << std::setw(12) << alerts
+                      << "                           |\n";
+            std::cout << "| Log saved to:        firewall_alerts.log                     |\n";
+            std::cout << "+--------------------------------------------------------------+\n";
+#ifdef _WIN32
+            SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+#else
+            std::cout << "\033[0m";
+#endif
+        }
+
         // Detected SNIs
         if (!stats_.detected_snis.empty()) {
             std::cout << "\n[Detected Domains/SNIs]\n";
