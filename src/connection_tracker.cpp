@@ -18,7 +18,9 @@ Connection* ConnectionTracker::getOrCreateConnection(const FiveTuple& tuple) {
     auto it = connections_.find(tuple);
     
     if (it != connections_.end()) {
-        return &it->second;
+        // Move to back of LRU list (most recently used)
+        lru_list_.splice(lru_list_.end(), lru_list_, it->second.lru_it);
+        return &it->second.conn;
     }
     
     // Check if we need to evict old connections
@@ -33,22 +35,31 @@ Connection* ConnectionTracker::getOrCreateConnection(const FiveTuple& tuple) {
     conn.first_seen = std::chrono::steady_clock::now();
     conn.last_seen = conn.first_seen;
     
-    auto result = connections_.emplace(tuple, std::move(conn));
+    // Add to back of LRU list
+    lru_list_.push_back(tuple);
+    auto lru_it = std::prev(lru_list_.end());
+    
+    ConnectionEntry entry{std::move(conn), lru_it};
+    auto result = connections_.emplace(tuple, std::move(entry));
     total_seen_++;
     
-    return &result.first->second;
+    return &result.first->second.conn;
 }
 
 Connection* ConnectionTracker::getConnection(const FiveTuple& tuple) {
     auto it = connections_.find(tuple);
     if (it != connections_.end()) {
-        return &it->second;
+        // Update LRU
+        lru_list_.splice(lru_list_.end(), lru_list_, it->second.lru_it);
+        return &it->second.conn;
     }
     
     // Try reverse tuple (for bidirectional matching)
     auto rev = connections_.find(tuple.reverse());
     if (rev != connections_.end()) {
-        return &rev->second;
+        // Update LRU for reverse too
+        lru_list_.splice(lru_list_.end(), lru_list_, rev->second.lru_it);
+        return &rev->second.conn;
     }
     
     return nullptr;
@@ -90,7 +101,7 @@ void ConnectionTracker::blockConnection(Connection* conn) {
 void ConnectionTracker::closeConnection(const FiveTuple& tuple) {
     auto it = connections_.find(tuple);
     if (it != connections_.end()) {
-        it->second.state = ConnectionState::CLOSED;
+        it->second.conn.state = ConnectionState::CLOSED;
     }
 }
 
@@ -100,9 +111,10 @@ size_t ConnectionTracker::cleanupStale(std::chrono::seconds timeout) {
     
     for (auto it = connections_.begin(); it != connections_.end(); ) {
         auto age = std::chrono::duration_cast<std::chrono::seconds>(
-            now - it->second.last_seen);
+            now - it->second.conn.last_seen);
         
-        if (age > timeout || it->second.state == ConnectionState::CLOSED) {
+        if (age > timeout || it->second.conn.state == ConnectionState::CLOSED) {
+            lru_list_.erase(it->second.lru_it);
             it = connections_.erase(it);
             removed++;
         } else {
@@ -118,7 +130,7 @@ std::vector<Connection> ConnectionTracker::getAllConnections() const {
     result.reserve(connections_.size());
     
     for (const auto& pair : connections_) {
-        result.push_back(pair.second);
+        result.push_back(pair.second.conn);
     }
     
     return result;
@@ -139,26 +151,22 @@ ConnectionTracker::TrackerStats ConnectionTracker::getStats() const {
 
 void ConnectionTracker::clear() {
     connections_.clear();
+    lru_list_.clear();
 }
 
 void ConnectionTracker::forEach(std::function<void(const Connection&)> callback) const {
     for (const auto& pair : connections_) {
-        callback(pair.second);
+        callback(pair.second.conn);
     }
 }
 
 void ConnectionTracker::evictOldest() {
-    if (connections_.empty()) return;
+    if (connections_.empty() || lru_list_.empty()) return;
     
-    // Find oldest connection
-    auto oldest = connections_.begin();
-    for (auto it = connections_.begin(); it != connections_.end(); ++it) {
-        if (it->second.last_seen < oldest->second.last_seen) {
-            oldest = it;
-        }
-    }
-    
-    connections_.erase(oldest);
+    // Oldest is at the front of the list
+    auto oldest_tuple = lru_list_.front();
+    lru_list_.pop_front();
+    connections_.erase(oldest_tuple);
 }
 
 // ============================================================================

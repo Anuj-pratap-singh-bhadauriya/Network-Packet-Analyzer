@@ -7,6 +7,7 @@
 #include <vector>
 #include <chrono>
 #include <functional>
+#include <list>
 
 namespace DPI {
 
@@ -77,10 +78,19 @@ private:
     int fp_id_;
     size_t max_connections_;
     
+    // Connection list for LRU eviction (front = oldest, back = newest)
+    std::list<FiveTuple> lru_list_;
+    
+    // Connection entry wrapping Connection and its LRU iterator
+    struct ConnectionEntry {
+        Connection conn;
+        std::list<FiveTuple>::iterator lru_it;
+    };
+    
     // Connection table
     // Note: FiveTuple hash ensures consistent mapping, so we don't need
     // to handle bidirectional flows specially here
-    std::unordered_map<FiveTuple, Connection, FiveTupleHash> connections_;
+    std::unordered_map<FiveTuple, ConnectionEntry, FiveTupleHash> connections_;
     
     // Statistics
     size_t total_seen_ = 0;
