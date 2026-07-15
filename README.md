@@ -13,11 +13,13 @@ This document explains **everything** about this project - from basic networking
 4. [File Structure](#4-file-structure)
 5. [The Journey of a Packet (Simple Version)](#5-the-journey-of-a-packet-simple-version)
 6. [The Journey of a Packet (Multi-threaded Version)](#6-the-journey-of-a-packet-multi-threaded-version)
-7. [Deep Dive: Each Component](#7-deep-dive-each-component)
-8. [How SNI Extraction Works](#8-how-sni-extraction-works)
-9. [How Blocking Works](#9-how-blocking-works)
-10. [Building and Running](#10-building-and-running)
-11. [Understanding the Output](#11-understanding-the-output)
+7. [Live Capture & Security Features](#7-live-capture--security-features)
+8. [Deep Dive: Each Component](#8-deep-dive-each-component)
+9. [How SNI Extraction Works](#9-how-sni-extraction-works)
+10. [How Blocking Works](#10-how-blocking-works)
+11. [Building and Running](#11-building-and-running)
+12. [Understanding the Output](#12-understanding-the-output)
+13. [Extending the Project](#13-extending-the-project)
 
 ---
 
@@ -123,14 +125,20 @@ TLS Client Hello:
 
 ### What This Project Does
 
+**Core Capabilities:**
+- **Live Network Capture:** Sniff directly from Wi-Fi/Ethernet adapters using Npcap/libpcap.
+- **Deep Packet Inspection:** Parse protocol headers and inspect payloads.
+- **Data Loss Prevention (DLP):** Scan unencrypted traffic (HTTP) for sensitive keywords (e.g., "password", "confidential").
+- **Bandwidth Monitoring:** Track which applications and IP addresses consume the most data.
+- **QUIC / HTTP3 SNI Extraction:** Inspect modern UDP-based encrypted traffic.
+
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Wireshark   │     │ DPI Engine  │     │ Output      │
-│ Capture     │ ──► │             │ ──► │ PCAP        │
-│ (input.pcap)│     │ - Parse     │     │ (filtered)  │
-└─────────────┘     │ - Classify  │     └─────────────┘
-                    │ - Block     │
-                    │ - Report    │
+│ Network     │     │ DPI Engine  │     │ Output      │
+│ Interface / │ ──► │ - Parse     │ ──► │ Alerts &    │
+│ PCAP File   │     │ - Classify  │     │ Filtered    │
+└─────────────┘     │ - Block     │     │ PCAP        │
+                    │ - Report    │     └─────────────┘
                     └─────────────┘
 ```
 
@@ -560,7 +568,24 @@ class TSQueue {
 
 ---
 
-## 7. Deep Dive: Each Component
+## 7. Live Capture & Security Features
+
+The DPI Engine supports inspecting traffic directly from your network interface in real-time, providing immediate visibility and security.
+
+### Real-time DNS Tracking
+When in live mode, the engine extracts and displays DNS queries in real-time (in cyan). This provides immediate visibility into which websites are being accessed before the actual data connection is established.
+
+### Data Loss Prevention (DLP)
+The engine can scan unencrypted traffic (such as HTTP on port 80/8080) for sensitive keywords defined by the user (e.g., "confidential", "password"). If a keyword is detected, it immediately triggers a magenta-colored console alert and logs the leak to `dlp_alerts.log`.
+
+### Live Bandwidth Monitor
+During and after a live capture, the engine generates a leaderboard showing:
+- **Top App Consumers:** Which applications (HTTPS, YouTube, etc.) are using the most data.
+- **Top IP Consumers:** Which specific IP addresses are generating the most traffic.
+
+---
+
+## 8. Deep Dive: Each Component
 
 ### pcap_reader.h / pcap_reader.cpp
 
@@ -689,7 +714,7 @@ AppType sniToAppType(const std::string& sni) {
 
 ---
 
-## 8. How SNI Extraction Works
+## 9. How SNI Extraction Works
 
 ### The TLS Handshake
 
@@ -801,9 +826,15 @@ std::optional<std::string> SNIExtractor::extract(
 }
 ```
 
+### QUIC / HTTP3 SNI Extraction
+
+QUIC is the transport protocol for HTTP/3, running over **UDP (port 443)** instead of TCP. QUIC encrypts most of its headers, but the initial handshake packet (the "Initial" packet) contains a standard TLS 1.3 ClientHello embedded inside it.
+
+The engine parses the QUIC Long Header to find the payload length, then searches within that payload for the TLS ClientHello signature (`0x01` handshake type) to extract the SNI just like normal HTTPS traffic.
+
 ---
 
-## 9. How Blocking Works
+## 10. How Blocking Works
 
 ### Rule Types
 
@@ -862,7 +893,7 @@ Connection to YouTube:
 
 ---
 
-## 10. Building and Running
+## 11. Building and Running
 
 ### Prerequisites
 
@@ -914,6 +945,18 @@ g++ -std=c++17 -pthread -O2 -I include -o dpi_engine \
 # Creates 4 LB threads × 4 FP threads = 16 processing threads
 ```
 
+**Live Capture Mode:**
+```bash
+# Capture from default interface
+./dpi_engine --live
+
+# Capture and save to PCAP file
+./dpi_engine --live -o recording.pcap
+
+# Live capture with DLP rules
+./dpi_engine --live --dlp-keyword "password" --dlp-keyword "confidential"
+```
+
 ### Creating Test Data
 
 ```bash
@@ -923,7 +966,7 @@ python3 generate_test_pcap.py
 
 ---
 
-## 11. Understanding the Output
+## 12. Understanding the Output
 
 ### Sample Output
 
@@ -988,11 +1031,14 @@ python3 generate_test_pcap.py
 | Dropped | Packets blocked (not written) |
 | Thread Statistics | Work distribution across threads |
 | Application Breakdown | Traffic classification results |
+| Bandwidth Monitor | Top consuming apps and IPs |
+| Firewall Summary | Number of blocked flows and log location |
+| DLP Summary | Number of detected data leaks and log location |
 | Detected SNIs | Actual domain names found |
 
 ---
 
-## 12. Extending the Project
+## 13. Extending the Project
 
 ### Ideas for Improvement
 
@@ -1011,20 +1057,13 @@ python3 generate_test_pcap.py
    }
    ```
 
-3. **Add Live Statistics Dashboard**
-   ```cpp
-   // Separate thread printing stats every second
-   void statsThread() {
-       while (running) {
-           printStats();
-           sleep(1);
-       }
-   }
-   ```
+3. **Kernel-Bypass Networking (DPDK / AF_XDP)**
+   - Bypass the OS network stack entirely for 10x performance gains.
+   - Ideal for analyzing 10Gbps+ networks.
 
-4. **Add QUIC/HTTP3 Support**
-   - QUIC uses UDP on port 443
-   - SNI is in the Initial packet (encrypted differently)
+4. **Stateful TCP Connection Tracking**
+   - Implement a full TCP state machine (SYN, ACK, FIN, RST).
+   - Merge bidirectional flows (client->server and server->client) into a single tracked session.
 
 5. **Add Persistent Rules**
    - Save rules to file
